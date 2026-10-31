@@ -17,6 +17,8 @@ from .models import FailureModel, MultiFidelityGP, RuntimeModel
 def prepare(args):
     with Path(args.csv).open(encoding="utf-8-sig", newline="") as stream:
         rows = list(csv.DictReader(stream))
+    if not rows or len({r['task_id'] for r in rows}) != len(rows):
+        raise ValueError('Replay needs nonempty, unique task_id records')
     columns = sorted([k for k in rows[0] if k.startswith("x") and k[1:].isdigit()], key=lambda k: int(k[1:]))
     if not columns:
         raise ValueError("Design coordinates must be named x0, x1, ...")
@@ -140,16 +142,22 @@ def optimize(args):
                     times.append(age)
                     censored.append(True)
                     fs.append(fidelity[i])
-            runtime = RuntimeModel().fit(np.array(time_features).reshape(-1, operational.shape[1]), times, censored, fs)
+            if args.no_runtime:
+                runtime = RuntimeModel().fit(np.empty((0, operational.shape[1])), [], [], [])
+            else:
+                runtime = RuntimeModel().fit(np.array(time_features).reshape(-1, operational.shape[1]), times, censored, fs)
             observed = [i for i in completed if not data["censored"][i]]
             failure = FailureModel().fit(operational[observed], data["failed"][observed])
-            pending_ids = list(pending) if not args.no_pending else []
-            if pending_ids:
-                ages = np.array([max(0, clock - pending[i]["start"]) for i in pending_ids])
-                durations = runtime.samples(operational[pending_ids], fidelity[pending_ids], args.samples, rng, ages)
+            physical_pending = list(pending)
+            pending_ids = physical_pending if not args.no_pending else []
+            if physical_pending:
+                ages = np.array([max(0, clock - pending[i]["start"]) for i in physical_pending])
+                durations = runtime.samples(operational[physical_pending], fidelity[physical_pending], args.samples, rng, ages)
                 remaining = np.maximum(durations - ages[:, None], 0)
-                available = (remaining <= args.deadline - clock).mean(1) * (1 if args.no_failure else 1 - failure.predict(operational[pending_ids]))
+                available = (remaining <= args.deadline - clock).mean(1) * (1 if args.no_failure else 1 - failure.predict(operational[physical_pending]))
                 makespan = remaining.max(0)
+                if args.no_pending:
+                    available = np.empty(0)
             else:
                 available, makespan = np.empty(0), np.zeros(args.samples)
             if len(candidates) > args.candidates:
@@ -246,7 +254,7 @@ def main():
     for key, value in [("deadline", 300), ("queue-delay", 1), ("source-scale", 1), ("recovery-prior", 1), ("stop", 1e-8), ("violation-tolerance", 0.05)]:
         p.add_argument("--" + key, type=float, default=value)
     p.add_argument("--net-time", action=argparse.BooleanOptionalAction, default=True)
-    for flag in ["no-pending", "no-reliability", "no-failure"]:
+    for flag in ["no-pending", "no-reliability", "no-failure", "no-runtime"]:
         p.add_argument("--" + flag, action="store_true")
     p.set_defaults(function=optimize)
     args = parser.parse_args()
