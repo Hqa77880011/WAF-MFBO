@@ -12,6 +12,7 @@ import numpy as np
 from scipy.special import ndtr
 
 from .models import FailureModel, MultiFidelityGP, RuntimeModel
+from .baselines import METHODS, Selector
 
 
 def prepare(args):
@@ -77,13 +78,24 @@ def optimize(args):
     free = np.zeros(args.workers)
     clock, overhead, recovery_time = 0.0, 0.0, 0.0
     trace = []
+    launch_log = []
+    selector = Selector(locations, args.method, args) if args.method in METHODS else None
     initial = rng.permutation(len(x))[:args.initial].tolist()
+
+    def charge_control(begin, already=0.):
+        nonlocal clock, overhead
+        extra = max(0., perf_counter() - begin - already)
+        overhead += extra
+        if args.net_time:
+            clock = min(args.deadline, clock + extra)
 
     def process(until):
         while events and events[0][0] <= until:
             finish, worker, task = heapq.heappop(events)
             completed.append(task)
             pending.pop(task)
+            if selector is not None:
+                selector.completed(task, data['y'][task])
             free[worker] = finish + (data["recovery"][task] if data["failed"][task] else 0)
             eligible = [i for i in completed if fidelity[i] == target and np.isfinite(data["y"][i]) and np.all(data["constraints"][i] <= 0)]
             best = min((float(data["y"][i]) for i in eligible), default=None)
@@ -91,20 +103,23 @@ def optimize(args):
                           "censored": bool(data["censored"][task]), "incumbent": best})
 
     while clock < args.deadline:
+        decision_begin, planning = perf_counter(), 0.
         process(clock)
         workers = np.flatnonzero(free <= clock)
         if not len(workers):
             future = [event[0] for event in events if event[0] > clock] + [float(v) for v in free if v > clock]
+            charge_control(decision_begin)
             if not future:
                 break
-            clock = min(min(future), args.deadline)
+            clock = min(max(clock, min(future)), args.deadline)
             continue
         worker = int(workers[0])
         candidates = np.array([i for i in range(len(x)) if i not in used])
         if not len(candidates):
+            charge_control(decision_begin)
             if not events:
                 break
-            clock = min(events[0][0], args.deadline)
+            clock = min(max(clock, events[0][0]), args.deadline)
             continue
         delay = 0.0
         quantile_forecast = np.exp(np.log(2.0) * fidelity[candidates[0]] + np.array([-1.28155, 0, 1.28155]))
@@ -116,6 +131,26 @@ def optimize(args):
         elif args.method == "random":
             task = int(rng.choice(candidates))
             quantile_forecast = np.exp(np.log(2.0) * fidelity[task] + np.array([-1.28155, 0, 1.28155]))
+        elif selector is not None:
+            begin = perf_counter()
+            task = selector.select(candidates, completed, data['y'][completed], data['runtime'][completed],
+                                   data['censored'][completed], locations[list(pending)], data['constraints'][completed], rng)
+            planning = perf_counter() - begin
+            overhead += planning
+            if args.net_time:
+                clock = min(args.deadline, clock + planning)
+            process(clock)
+            if clock >= args.deadline:
+                charge_control(decision_begin, planning)
+                break
+            if task is None:
+                charge_control(decision_begin, planning)
+                if events:
+                    clock = min(max(clock, events[0][0]), args.deadline)
+                    continue
+                break
+            quantile_forecast = np.asarray(selector.diagnostic.get('runtime_quantiles',
+                                          np.exp(np.log(2.) * fidelity[task] + np.array([-1.28155, 0., 1.28155]))))
         else:
             begin = perf_counter()
             usable = [i for i in completed if np.isfinite(data["y"][i]) and not data["censored"][i]]
@@ -194,7 +229,13 @@ def optimize(args):
                 clock = min(args.deadline, clock + planning)
             process(clock)
             if clock >= args.deadline or best_score <= args.stop:
+                charge_control(decision_begin, planning)
                 break
+        charge_control(decision_begin, planning)
+        process(clock)
+        if clock >= args.deadline:
+            break
+        ledger_begin = perf_counter()
         start_time = clock + delay
         finish = start_time + float(data["runtime"][task])
         used.add(task)
@@ -203,7 +244,11 @@ def optimize(args):
         predicted_quantiles[task] = quantile_forecast
         free[worker] = finish
         heapq.heappush(events, (finish, worker, task))
+        launch_log.append(json.dumps(dict(time=float(clock), start=float(start_time), worker=worker,
+                               task=str(data['task'][task]), completed_observations=len(completed),
+                               method=args.method, diagnostics=selector.diagnostic.copy() if selector is not None else {}), allow_nan=False))
         recovery_time += float(data["recovery"][task]) if data["failed"][task] else 0
+        charge_control(ledger_begin)
     process(args.deadline)
     completed_target = [i for i in completed if fidelity[i] == target and np.isfinite(data["y"][i]) and not data["censored"][i] and np.all(data["constraints"][i] <= 0)]
     best = min((float(data["y"][i]) for i in completed_target), default=None)
@@ -229,6 +274,8 @@ def optimize(args):
     out.mkdir(parents=True, exist_ok=True)
     (out / "metrics.json").write_text(json.dumps(metrics, indent=2, allow_nan=False))
     (out / "events.json").write_text(json.dumps(trace, indent=2, allow_nan=False))
+    (out / 'launches.json').write_text('[\n' + ',\n'.join(launch_log) + '\n]', encoding='utf-8')
+    (out / 'settings.json').write_text(json.dumps({k: v for k, v in vars(args).items() if k != 'function'}, indent=2), encoding='utf-8')
     (out / "pending.json").write_text(json.dumps([{ "task": str(data["task"][i]), "elapsed_lower_bound": max(0, args.deadline - job["start"])} for i, job in pending.items()], indent=2))
     fig, ax = plt.subplots(figsize=(7, 4))
     ax.step([r["time"] for r in trace if r["incumbent"] is not None], [r["incumbent"] for r in trace if r["incumbent"] is not None], where="post")
@@ -248,7 +295,9 @@ def main():
     p = sub.add_parser("run")
     p.add_argument("--data", default="data/prepared")
     p.add_argument("--output", default="runs/full")
-    p.add_argument("--method", choices=["full", "information", "random"], default="full")
+    p.add_argument("--method", choices=["full", "information", "random", *METHODS], default="full")
+    p.add_argument('--robust-variance', type=float, default=.1)
+    p.add_argument('--robust-information', type=float, default=.001)
     for key, value in [("workers", 4), ("initial", 8), ("candidates", 32), ("samples", 32), ("fantasies", 16), ("seed", 42)]:
         p.add_argument("--" + key, type=int, default=value)
     for key, value in [("deadline", 300), ("queue-delay", 1), ("source-scale", 1), ("recovery-prior", 1), ("stop", 1e-8), ("violation-tolerance", 0.05)]:
