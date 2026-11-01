@@ -1,6 +1,6 @@
 # WAF-MFBO
 
-Implementation of **Failure- and Runtime-Aware Asynchronous Multi-Fidelity Optimization under Wall-Clock Budgets**, with explicit finite-pool engineering adaptations of its comparison algorithms.
+**Failure- and Runtime-Aware Asynchronous Multi-Fidelity Optimization under Wall-Clock Budgets** using a shared finite-pool asynchronous engine.
 
 ## Install and input
 
@@ -29,7 +29,7 @@ Coordinates/fidelities in the task pool are known before search. Bounds normaliz
 
 All methods share the initial random task permutation, finite pool, workers, deadline, feasibility rule and completion/recovery events. `--net-time` (default) charges actual model/acquisition computation, dispatch/scheduling work and the JSON serialization used for the launch ledger. Final report/plot file writes are outside the decision loop. `--no-net-time` is a declared overhead-excluded comparison.
 
-These are engineering finite-pool adaptations: RBF hyperparameters are fixed; FABOLAS maps source indices to s=2**(f-target), models signed engineering objectives directly instead of log classification loss, and uses a finite minimizer grid. rMFBO defaults `--robust-variance .1 --robust-information .001`; the original sequential guarantee is not asserted for asynchronous finite-pool execution. Async-MFBO uses information-based fidelity choice and a finite-grid Lipschitz estimate. Hyperband/BOHB need matched configurations across fidelities. These conventions distinguish the algorithms without claiming the historical software/configuration is recovered.
+RBF hyperparameters are fixed. FABOLAS maps fidelity to s=2**(f-target), models signed objectives and uses a finite minimizer grid. rMFBO defaults to `--robust-variance .1 --robust-information .001`; Async-MFBO uses information-based fidelity selection and a finite-grid Lipschitz estimate. Hyperband/BOHB require matched configurations across fidelities.
 
 ```bash
 waf_mfbo run --data data/prepared --deadline 300 --workers 4 --method mfmes --output runs/mfmes --seed 42
@@ -46,9 +46,9 @@ python -m waf_mfbo.benchmarks --problem forrester --designs 128 --tail lognormal
 waf_mfbo prepare --csv data/forrester/replay.csv --output data/forrester/prepared
 ```
 
-`--problem` supports forrester, branin, park and sellar, each with three nested sources. Canonical target functions follow the [Forrester/Park library](https://www.sfu.ca/~ssurjano/optimization.html) and [OpenMDAO Sellar equations/constraints](https://openmdao.org/newdocs/versions/latest/basic_user_guide/multidisciplinary_optimization/sellar.html). Intermediate/biased source formulas are explicitly coded choices because the historical engineering constructions are unavailable. Sellar actually solves its coupled disciplines and records nonconvergence as failure. `definition.json` states every generated operational setting.
+`--problem` supports Forrester, Branin, Park and coupled Sellar, with three nested sources. Targets follow the [Forrester/Park library](https://www.sfu.ca/~ssurjano/optimization.html) and [OpenMDAO Sellar equations](https://openmdao.org/newdocs/versions/latest/basic_user_guide/multidisciplinary_optimization/sellar.html). Source formulas and operational settings are recorded in `definition.json`; Sellar nonconvergence is recorded as failure.
 
-`--tail lognormal`, `pareto`, `deterministic` provide declared generated completion processes; Pareto is median-matched. `--pilot pilot.csv` instead fits log-runtime and failure models from supplied exact-termination pilot records with normalized coordinates, excluding censored records. Original pilot logs are not bundled. Generated observations are benchmark inputs, not a reproduction of production-cluster measurements or paper regret values.
+`--tail lognormal|pareto|deterministic` selects a generated completion process; Pareto is median-matched. `--pilot pilot.csv` fits log-runtime/failure models from exact-termination records using normalized coordinates, excluding censored records.
 
 ## Metrics and paired reporting
 
@@ -60,11 +60,9 @@ python -m waf_mfbo.report --manifest comparison_runs.json --output comparison.js
 
 Manifest entries are `{ "problem":"forrester", "seed":42, "method":"full", "run":"runs/full" }`, with run paths relative to the manifest. Reporting verifies worker/deadline/initial/time-accounting parity, computes per-problem seed means/sampleSD and an equal-problem macro mean. Missing feasible incumbents are retained: primary mean regret is null if any run has no incumbent, conditional mean and feasibility rate are reported separately. No failed run is silently dropped.
 
-## Actual verification
+## Checks
 
 ```bash
 python -m unittest discover -s tests -v
 python -m waf_mfbo.smoke
 ```
-
-Algorithm regressions verify target MES=log2 at standardized threshold0; zero information for independent sources; FABOLAS environment covariance; actual observed Hyperband9->3->1 promotions and waiting; BOHB KDE direction; robust SF fallback; canonical Forrester/Branin minima and coupled Sellar values. All seven optimization methods execute on an evaluated Forrester pool with identical initial observations and clipped workers/deadlines; a real-time check verifies dispatch overhead is charged. Existing GP fit/PSD/checkpoint/survival draws/ablation checks also pass. Python3.13.5, NumPy2.1.3, SciPy1.15.3, scikit-learn1.6.1, CPU one BLAS thread. No full five-seed/four-benchmark study or original numerical table is claimed.

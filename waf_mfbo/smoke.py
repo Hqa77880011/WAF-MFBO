@@ -1,4 +1,4 @@
-"""Generated replay checks; output is not paper benchmark evidence."""
+"""Exercise optimization with generated replay data."""
 import argparse
 import csv
 import json

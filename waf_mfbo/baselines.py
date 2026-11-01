@@ -1,7 +1,7 @@
-"""Distinct finite-pool adaptations of the paper's engineering comparison controls.
+"""Finite-pool asynchronous acquisition controls.
 
-All objective/runtime arguments below contain completed observations only.
-The adaptation conventions and primary algorithm sources are documented in README.
+Objective/runtime inputs contain completed observations only.
+Algorithm conventions and primary sources are documented in README.
 """
 import numpy as np
 from numpy.polynomial.hermite import hermgauss
